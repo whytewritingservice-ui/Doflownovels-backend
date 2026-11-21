@@ -2066,6 +2066,823 @@ app.get(
 // =========================================================
 
 
+/*
+ DOFLOWNOVELS — CONSOLIDATED ADDITIVE BACKEND OVERRIDE
+ Targets the current Express 4.18.2 server.js in:
+ whytewritingservice-ui/Doflownovels-backend (main)
+
+ INSTALL: Paste this entire file's contents immediately BEFORE
+ the existing // --- 5. START SERVER --- line in server.js.
+ Do NOT delete the existing Codo routes, Flutterwave webhook,
+ admin unlock route, Firebase initialization, or app.listen.
+
+ This patches matching existing Express route handlers in place.
+ New manuscripts are stored as one Firestore document per chapter
+ to avoid the Firestore 1 MiB document-size limit.
+*/
+
+(function dfInstallConsolidatedBackendOverride() {
+  'use strict';
+
+  if (globalThis.__DF_CODO_OVERRIDE_INSTALLED__) return;
+  globalThis.__DF_CODO_OVERRIDE_INSTALLED__ = true;
+
+  if (!app || !db || !admin || !app._router || !Array.isArray(app._router.stack)) {
+    throw new Error('Doflow override could not locate the existing Express 4 app/router/Firebase Admin objects.');
+  }
+
+  // The existing express.json() default is 100 KB. Private manuscript publishing
+  // needs a larger JSON body limit while the existing 5 MB DOCX upload cap remains.
+  const dfJsonParserLayer = app._router.stack.find(layer => layer && layer.name === 'jsonParser');
+  if (!dfJsonParserLayer) throw new Error('Doflow override could not locate the existing Express JSON parser.');
+  dfJsonParserLayer.handle = express.json({ limit: '12mb' });
+
+  function dfFindRoute(method, path) {
+    const layer = app._router.stack.find(item =>
+      item && item.route && item.route.path === path &&
+      item.route.methods && item.route.methods[String(method).toLowerCase()]
+    );
+    if (!layer) throw new Error('Doflow override could not find existing route: ' + method + ' ' + path);
+    return layer.route;
+  }
+
+  function dfReplaceRouteHandler(method, path, handler) {
+    const route = dfFindRoute(method, path);
+    if (!Array.isArray(route.stack) || !route.stack.length) {
+      throw new Error('Doflow override found an empty route stack: ' + method + ' ' + path);
+    }
+    route.stack[route.stack.length - 1].handle = handler;
+  }
+
+  function dfReplaceRouteAuth(method, path, handler) {
+    const route = dfFindRoute(method, path);
+    if (!Array.isArray(route.stack) || !route.stack.length) {
+      throw new Error('Doflow override found an empty route stack: ' + method + ' ' + path);
+    }
+    route.stack[0].handle = handler;
+  }
+
+  function dfOptionalFirebaseAuth(req, res, next) {
+    const header = String(req.headers.authorization || '');
+    if (!header) {
+      req.dfCodoUser = null;
+      return next();
+    }
+    if (!header.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, error: 'Invalid authorization header.' });
+    }
+    admin.auth().verifyIdToken(header.slice(7))
+      .then(decoded => {
+        req.dfCodoUser = decoded;
+        next();
+      })
+      .catch(() => res.status(401).json({ success: false, error: 'Your login session is invalid or expired.' }));
+  }
+
+  function dfOverrideIsLocked(chapter) {
+    return !!(chapter && (chapter.locked === true || chapter.isLocked === true || chapter.lock === true));
+  }
+
+  function dfOverrideWordCount(content) {
+    const plain = String(content || '')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;|&#160;|&#xA0;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&apos;/gi, "'")
+      .trim();
+    return plain ? plain.split(/\s+/).filter(Boolean).length : 0;
+  }
+
+  function dfOverrideChapterId(chapter, index) {
+    return String((chapter && (chapter.id || chapter.chapterId)) || index);
+  }
+
+  function dfOverrideChapterDocId(index) {
+    return String(index).padStart(6, '0');
+  }
+
+  async function dfOverrideLoadChapterDocuments(bookId) {
+    const snapshot = await db.collection('privateBookChapters')
+      .doc(bookId).collection('chapters').orderBy('index').get();
+    return snapshot.docs.map(doc => doc.data() || {});
+  }
+
+  async function dfOverrideDeleteChapterDocuments(bookId) {
+    const collectionRef = db.collection('privateBookChapters')
+      .doc(bookId).collection('chapters');
+    for (;;) {
+      const snapshot = await collectionRef.limit(400).get();
+      if (snapshot.empty) break;
+      const batch = db.batch();
+      snapshot.docs.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+    }
+  }
+
+  function dfOverrideError(res, error) {
+    const map = {
+      BOOK_NOT_FOUND: [404, 'Book not found.'],
+      CHAPTERS_NOT_FOUND: [404, 'Chapter data is not available for this book.'],
+      INVALID_BOOK_AUTHOR: [400, 'This book has no valid author account.'],
+      AUTHOR_NOT_PARTICIPATING: [403, 'This author is not participating in Codo Bills.'],
+      INVALID_CHAPTER_SELECTION: [400, 'Choose between 1 and 15 valid chapters.'],
+      CHAPTER_ID_INDEX_MISMATCH: [400, 'The chapter IDs and chapter indexes do not match.'],
+      CHAPTER_NOT_LOCKED: [400, 'Every selected chapter must be locked.'],
+      CHAPTER_BELOW_WORD_LIMIT: [400, 'Every selected chapter must contain at least 1,200 words.'],
+      CHAPTER_ALREADY_UNLOCKED: [409, 'One or more selected chapters have already been unlocked.'],
+      INSUFFICIENT_BILLS: [402, 'You do not have enough Codo Bills.'],
+      PAYMENT_NOT_FOUND: [404, 'Payment record not found.'],
+      PAYMENT_NOT_PENDING: [409, 'This payment is not awaiting verification.'],
+      PAYMENT_ID_REUSED: [409, 'This Flutterwave transaction has already been used for another payment.'],
+      PAYMENT_DETAILS_MISMATCH: [400, 'Flutterwave payment details do not exactly match the checkout.']
+    };
+    const entry = map[error && error.message];
+    if (entry) return res.status(entry[0]).json({ success: false, error: entry[1] });
+    console.error('Doflow consolidated override error:', error);
+    return res.status(500).json({ success: false, error: 'The request could not be completed. Please try again.' });
+  }
+
+  // ---------------------------------------------------------
+  // 1. PACKAGE UNLOCK — IDs/indexes accepted; all writes atomic
+  // ---------------------------------------------------------
+  async function dfCorrectedUnlockPackage(req, res) {
+    try {
+      const uid = req.dfCodoUser.uid;
+      const email = String(req.dfCodoUser.email || '').toLowerCase();
+      const body = req.body || {};
+      const bookId = String(body.bookId || '').trim();
+      const wantedIndexes = Array.isArray(body.chapterIndexes) ? body.chapterIndexes : null;
+      const wantedIds = Array.isArray(body.chapterIds) ? body.chapterIds.map(String) : null;
+
+      if (!bookId || (!wantedIndexes && !wantedIds)) throw new Error('INVALID_CHAPTER_SELECTION');
+      if ((wantedIndexes && (wantedIndexes.length < 1 || wantedIndexes.length > 15)) ||
+          (wantedIds && (wantedIds.length < 1 || wantedIds.length > 15))) {
+        throw new Error('INVALID_CHAPTER_SELECTION');
+      }
+      if (wantedIndexes && (wantedIndexes.some(v => !Number.isInteger(Number(v)) || Number(v) < 0) ||
+          new Set(wantedIndexes.map(Number)).size !== wantedIndexes.length)) {
+        throw new Error('INVALID_CHAPTER_SELECTION');
+      }
+      if (wantedIds && (wantedIds.some(v => !v.trim()) || new Set(wantedIds).size !== wantedIds.length)) {
+        throw new Error('INVALID_CHAPTER_SELECTION');
+      }
+
+      // The real platform administrator has reading access without a deduction.
+      if (email === 'whytewritingservice@gmail.com') {
+        return res.json({ success: true, unlimitedAccess: true, billsDeducted: 0, message: 'Administrator unlimited reading access.' });
+      }
+
+      const settings = await dfCodoGetSettings();
+      if (!settings.enabled) return res.status(403).json({ success: false, error: 'Codo Bills are temporarily disabled.' });
+
+      const bookRef = db.collection('books').doc(bookId);
+      const privateRef = db.collection('privateBookChapters').doc(bookId);
+      const walletRef = db.collection('codoWallets').doc(uid);
+      const accessRef = db.collection('codoPackageAccess').doc(uid + '_' + bookId);
+
+      // A stable ID makes a repeat request for the exact same package idempotent.
+      const canonicalSelection = (wantedIndexes ? wantedIndexes.map(Number) : wantedIds.slice()).map(String).sort().join('|');
+      const idempotencyHash = dfCodoCrypto.createHash('sha256')
+        .update(uid + '|' + bookId + '|' + canonicalSelection)
+        .digest('hex');
+      const transactionId = 'unlock_' + idempotencyHash;
+      const transactionRef = db.collection('codoTransactions').doc(transactionId);
+      const earningRef = db.collection('codoAuthorEarnings').doc(transactionId);
+
+      const outcome = await db.runTransaction(async tx => {
+        const [bookSnap, privateSnap, walletSnap, accessSnap, priorTxSnap] = await Promise.all([
+          tx.get(bookRef), tx.get(privateRef), tx.get(walletRef), tx.get(accessRef), tx.get(transactionRef)
+        ]);
+        if (!bookSnap.exists) throw new Error('BOOK_NOT_FOUND');
+        const book = bookSnap.data() || {};
+        const chapterSource = privateSnap.exists ? (privateSnap.data() || {}) : book;
+        let chapters = Array.isArray(chapterSource.chapters) ? chapterSource.chapters : [];
+        if (!chapters.length && privateSnap.exists) {
+          const chapterDocs = await tx.get(
+            privateRef.collection('chapters').orderBy('index')
+          );
+          chapters = chapterDocs.docs.map(doc => doc.data() || {});
+        }
+        if (!chapters.length) throw new Error('CHAPTERS_NOT_FOUND');
+        const authorId = book.authorId || chapterSource.authorId;
+        if (!authorId) throw new Error('INVALID_BOOK_AUTHOR');
+
+        const authorRef = db.collection('authors').doc(authorId);
+        const authorSnap = await tx.get(authorRef);
+        if (!authorSnap.exists || authorSnap.data().codoEnabled !== true) throw new Error('AUTHOR_NOT_PARTICIPATING');
+
+        let indexes;
+        if (wantedIndexes) {
+          indexes = wantedIndexes.map(Number);
+        } else {
+          indexes = wantedIds.map(id => chapters.findIndex((chapter, index) => dfOverrideChapterId(chapter, index) === id));
+        }
+        if (indexes.length < 1 || indexes.length > 15 || indexes.some(i => !Number.isInteger(i) || i < 0 || i >= chapters.length) || new Set(indexes).size !== indexes.length) {
+          throw new Error('INVALID_CHAPTER_SELECTION');
+        }
+        const resolvedIds = indexes.map(i => dfOverrideChapterId(chapters[i], i));
+        if (wantedIds && (resolvedIds.length !== wantedIds.length || resolvedIds.some(id => !wantedIds.includes(id)))) {
+          throw new Error('CHAPTER_ID_INDEX_MISMATCH');
+        }
+        if (wantedIndexes && wantedIds && wantedIndexes.length !== wantedIds.length) throw new Error('CHAPTER_ID_INDEX_MISMATCH');
+
+        // If this exact package has already committed, acknowledge it without charging again.
+        if (priorTxSnap.exists && priorTxSnap.data().status === 'successful') {
+          const wallet = walletSnap.exists ? walletSnap.data() : {};
+          return {
+            alreadyProcessed: true,
+            indexes,
+            purchasedBills: Number(wallet.purchasedBills || 0),
+            awardedBills: Number(wallet.awardedBills || 0),
+            billSource: priorTxSnap.data().billSource || 'unknown',
+            awardFundingSource: priorTxSnap.data().awardFundingSource || null
+          };
+        }
+
+        const existing = accessSnap.exists ? (accessSnap.data() || {}) : {};
+        const existingIndexes = Array.isArray(existing.chapterIndexes) ? existing.chapterIndexes : [];
+        if (indexes.some(i => existingIndexes.includes(i))) throw new Error('CHAPTER_ALREADY_UNLOCKED');
+
+        for (const index of indexes) {
+          const chapter = chapters[index];
+          if (!dfOverrideIsLocked(chapter)) throw new Error('CHAPTER_NOT_LOCKED');
+          if (dfOverrideWordCount(chapter.content) < 1200) throw new Error('CHAPTER_BELOW_WORD_LIMIT');
+        }
+
+        const wallet = walletSnap.exists ? (walletSnap.data() || {}) : {};
+        const purchased = Math.max(0, Number(wallet.purchasedBills || 0));
+        const awarded = Math.max(0, Number(wallet.awardedBills || 0));
+        if (purchased + awarded < 1) throw new Error('INSUFFICIENT_BILLS');
+
+        const usePurchased = purchased > 0;
+        const nextPurchased = usePurchased ? purchased - 1 : purchased;
+        const nextAwarded = usePurchased ? awarded : awarded - 1;
+        const awardedBySource = Object.assign({ doflow: 0, contest_sponsor: 0, author: 0 }, wallet.awardedBySource || {});
+        const knownAwarded = Number(awardedBySource.doflow || 0) + Number(awardedBySource.contest_sponsor || 0) + Number(awardedBySource.author || 0);
+        const legacyAwarded = Math.max(0, awarded - knownAwarded);
+        if (legacyAwarded) awardedBySource.legacy_unattributed = legacyAwarded;
+        let awardFundingSource = null;
+        if (!usePurchased) {
+          const sourceOrder = ['doflow', 'contest_sponsor', 'author', 'legacy_unattributed'];
+          awardFundingSource = sourceOrder.find(source => Number(awardedBySource[source] || 0) > 0) || 'legacy_unattributed';
+          awardedBySource[awardFundingSource] = Math.max(0, Number(awardedBySource[awardFundingSource] || 0) - 1);
+        }
+        const billValueGBP = usePurchased ? Number(settings.billPriceGBP) : 0;
+        const authorShareGBP = usePurchased ? dfCodoRoundMoney(billValueGBP * 0.70) : 0;
+        const platformShareGBP = usePurchased ? dfCodoRoundMoney(billValueGBP * 0.30) : 0;
+
+        // Every read is complete before any write in this transaction.
+        tx.set(walletRef, { uid, purchasedBills: nextPurchased, awardedBills: nextAwarded, awardedBySource, updatedAt: dfCodoTime() }, { merge: true });
+        tx.set(accessRef, {
+          uid, bookId, authorId,
+          chapterIndexes: Array.from(new Set(existingIndexes.concat(indexes))).sort((a, b) => a - b),
+          updatedAt: dfCodoTime()
+        }, { merge: true });
+        tx.set(transactionRef, {
+          uid, bookId, authorId, type: 'package_unlock', chapterIndexes: indexes,
+          chapterIds: resolvedIds, chapterCount: indexes.length, billsSpent: 1,
+          billSource: usePurchased ? 'purchased' : 'awarded', awardFundingSource,
+          authorShareGBP, platformShareGBP, status: 'successful', createdAt: dfCodoTime()
+        });
+        // Cash earnings are created atomically only for purchased bills.
+        // Promotional/awarded bills do not create cash earnings in this policy.
+        if (usePurchased) {
+          tx.set(earningRef, {
+            authorId, readerUid: uid, bookId, transactionId,
+            authorShareGBP, platformShareGBP, status: 'pending', createdAt: dfCodoTime()
+          });
+        }
+        return {
+          alreadyProcessed: false, indexes, purchasedBills: nextPurchased, awardedBills: nextAwarded,
+          billSource: usePurchased ? 'purchased' : 'awarded', awardFundingSource, authorShareGBP, platformShareGBP
+        };
+      });
+
+      return res.json({
+        success: true,
+        alreadyProcessed: outcome.alreadyProcessed,
+        bookId,
+        unlockedChapters: outcome.indexes,
+        billsDeducted: outcome.alreadyProcessed ? 0 : 1,
+        billSource: outcome.billSource,
+        awardFundingSource: outcome.awardFundingSource || null,
+        transactionId,
+        wallet: { purchasedBills: outcome.purchasedBills, awardedBills: outcome.awardedBills },
+        message: outcome.alreadyProcessed ? 'This package was already unlocked; no extra bill was deducted.' : 'Chapter package unlocked successfully.'
+      });
+    } catch (error) {
+      return dfOverrideError(res, error);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 2. PAYMENT VERIFICATION — exact amount/currency + replay guard
+  // ---------------------------------------------------------
+  async function dfCorrectedVerifyPayment(req, res) {
+    try {
+      const uid = req.dfCodoUser.uid;
+      const { transactionId, txRef } = req.body || {};
+      if (!transactionId || typeof txRef !== 'string' || !txRef.startsWith('codo_' + uid + '_')) {
+        return res.status(400).json({ success: false, error: 'A valid payment transaction ID and your own payment reference are required.' });
+      }
+      if (!process.env.FLW_SECRET_KEY) return res.status(503).json({ success: false, error: 'Flutterwave is not configured.' });
+
+      const paymentRef = db.collection('codoTransactions').doc(txRef);
+      const initialSnap = await paymentRef.get();
+      if (!initialSnap.exists) throw new Error('PAYMENT_NOT_FOUND');
+      const initial = initialSnap.data() || {};
+      if (initial.uid !== uid || initial.type !== 'bill_purchase') return res.status(403).json({ success: false, error: 'Payment ownership check failed.' });
+      if (initial.status === 'successful') return res.json({ success: true, alreadyProcessed: true, bills: Number(initial.bundle || 0) });
+      if (initial.status !== 'pending') throw new Error('PAYMENT_NOT_PENDING');
+
+      const verifyResponse = await fetch('https://api.flutterwave.com/v3/transactions/' + encodeURIComponent(transactionId) + '/verify', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer ' + process.env.FLW_SECRET_KEY, 'Content-Type': 'application/json' }
+      });
+      const verifyResult = await verifyResponse.json();
+      const paid = verifyResult && verifyResult.data;
+      const actualAmount = Number(paid && paid.amount);
+      const expectedAmount = Number(initial.amount);
+      const actualCurrency = String((paid && paid.currency) || '').toUpperCase();
+      const expectedCurrency = String(initial.currency || '').toUpperCase();
+      const actualEmail = String((paid && paid.customer && paid.customer.email) || '').toLowerCase();
+      const expectedEmail = String(initial.email || '').toLowerCase();
+      const idMatches = !paid || paid.id == null || String(paid.id) === String(transactionId);
+      const metaUidMatches = !paid || !paid.meta || !paid.meta.uid || paid.meta.uid === uid;
+      if (!verifyResponse.ok || !verifyResult || verifyResult.status !== 'success' || !paid ||
+          paid.status !== 'successful' || paid.tx_ref !== txRef || !idMatches || !metaUidMatches ||
+          !Number.isFinite(actualAmount) || Math.round(actualAmount * 100) !== Math.round(expectedAmount * 100) ||
+          actualCurrency !== expectedCurrency || actualEmail !== expectedEmail) {
+        throw new Error('PAYMENT_DETAILS_MISMATCH');
+      }
+
+      const walletRef = db.collection('codoWallets').doc(uid);
+      const processorRef = db.collection('codoFlutterwaveTransactions').doc(String(transactionId));
+
+      const result = await db.runTransaction(async tx => {
+        const [currentPaymentSnap, walletSnap, processorSnap] = await Promise.all([
+          tx.get(paymentRef), tx.get(walletRef), tx.get(processorRef)
+        ]);
+        if (!currentPaymentSnap.exists) throw new Error('PAYMENT_NOT_FOUND');
+        const current = currentPaymentSnap.data() || {};
+        if (current.uid !== uid || current.type !== 'bill_purchase') throw new Error('PAYMENT_DETAILS_MISMATCH');
+        if (current.status === 'successful') return { alreadyProcessed: true, bills: Number(current.bundle || 0) };
+        if (current.status !== 'pending') throw new Error('PAYMENT_NOT_PENDING');
+        if (processorSnap.exists) {
+          const claimed = processorSnap.data() || {};
+          if (claimed.txRef !== txRef || claimed.uid !== uid) throw new Error('PAYMENT_ID_REUSED');
+          throw new Error('PAYMENT_NOT_PENDING');
+        }
+        const wallet = walletSnap.exists ? (walletSnap.data() || {}) : {};
+        const bills = Number(current.bundle);
+        if (!Number.isInteger(bills) || ![1, 3, 5, 10].includes(bills)) throw new Error('PAYMENT_DETAILS_MISMATCH');
+        tx.set(walletRef, {
+          uid,
+          purchasedBills: Number(wallet.purchasedBills || 0) + bills,
+          awardedBills: Number(wallet.awardedBills || 0),
+          updatedAt: dfCodoTime()
+        }, { merge: true });
+        tx.update(paymentRef, {
+          status: 'successful',
+          flutterwaveTransactionId: String(transactionId),
+          verifiedAmount: actualAmount,
+          verifiedCurrency: actualCurrency,
+          verifiedAt: dfCodoTime()
+        });
+        tx.set(processorRef, { uid, txRef, amount: actualAmount, currency: actualCurrency, createdAt: dfCodoTime() });
+        return { alreadyProcessed: false, bills };
+      });
+
+      return res.json({ success: true, alreadyProcessed: result.alreadyProcessed, bills: result.bills, message: result.alreadyProcessed ? 'Payment was already credited.' : 'Payment verified and Codo Bills added.' });
+    } catch (error) {
+      if (error && error.message === 'PAYMENT_DETAILS_MISMATCH') {
+        return res.status(400).json({ success: false, error: 'Payment details did not exactly match the checkout. No bills were credited.' });
+      }
+      return dfOverrideError(res, error);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 3. SECURE READER — public visitors can read free chapters
+  // ---------------------------------------------------------
+  async function dfCorrectedReadChapters(req, res) {
+    try {
+      const bookId = req.params.bookId;
+      const uid = req.dfCodoUser ? req.dfCodoUser.uid : null;
+      const email = String(req.dfCodoUser && req.dfCodoUser.email || '').toLowerCase();
+      const isAdmin = email === 'whytewritingservice@gmail.com';
+      const bookRef = db.collection('books').doc(bookId);
+      const privateRef = db.collection('privateBookChapters').doc(bookId);
+      const [bookSnap, privateSnap] = await Promise.all([bookRef.get(), privateRef.get()]);
+      if (!bookSnap.exists) return res.status(404).json({ success: false, error: 'Book not found.' });
+      const book = bookSnap.data() || {};
+      const source = privateSnap.exists ? (privateSnap.data() || {}) : book;
+      let chapters = Array.isArray(source.chapters) ? source.chapters : [];
+      if (!chapters.length && privateSnap.exists) {
+        chapters = await dfOverrideLoadChapterDocuments(bookId);
+      }
+      if (!chapters.length) return res.status(404).json({ success: false, error: 'No chapter content is available for this book.' });
+      const isAuthor = !!uid && book.authorId === uid;
+      let unlockedIndexes = [];
+      if (uid && !isAdmin && !isAuthor) {
+        const accessSnap = await db.collection('codoPackageAccess').doc(uid + '_' + bookId).get();
+        if (accessSnap.exists && Array.isArray(accessSnap.data().chapterIndexes)) unlockedIndexes = accessSnap.data().chapterIndexes;
+      }
+      const safeChapters = chapters.map((chapter, index) => {
+        const locked = dfOverrideIsLocked(chapter);
+        const hasAccess = isAdmin || isAuthor || !locked || unlockedIndexes.includes(index);
+        return {
+          id: dfOverrideChapterId(chapter, index),
+          index,
+          title: chapter.title || 'Chapter ' + (index + 1),
+          locked,
+          wordCount: dfOverrideWordCount(chapter.content),
+          hasAccess,
+          content: hasAccess ? String(chapter.content || '') : null
+        };
+      });
+      return res.json({
+        success: true,
+        bookId,
+        unlimitedAccess: isAdmin,
+        chapters: safeChapters,
+        chaptersPrivate: !!privateSnap.exists,
+        privacyEnforced: !!privateSnap.exists
+      });
+    } catch (error) {
+      console.error('Doflow secure reader override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to load chapters.' });
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 4. OPTIONAL-LOGIN ACCESS LOOKUP (anonymous = no paid access)
+  // ---------------------------------------------------------
+  async function dfCorrectedAccessLookup(req, res) {
+    try {
+      const uid = req.dfCodoUser ? req.dfCodoUser.uid : null;
+      const email = String(req.dfCodoUser && req.dfCodoUser.email || '').toLowerCase();
+      if (email === 'whytewritingservice@gmail.com') {
+        return res.json({ success: true, unlimitedAccess: true, chapterIndexes: [] });
+      }
+      if (!uid) return res.json({ success: true, unlimitedAccess: false, chapterIndexes: [] });
+      const snap = await db.collection('codoPackageAccess').doc(uid + '_' + req.params.bookId).get();
+      const data = snap.exists ? snap.data() : {};
+      return res.json({ success: true, unlimitedAccess: false, chapterIndexes: Array.isArray(data.chapterIndexes) ? data.chapterIndexes : [] });
+    } catch (error) {
+      console.error('Doflow access lookup override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to check chapter access.' });
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 5. MARK-PAID — atomic status transition prevents double payout
+  // ---------------------------------------------------------
+  async function dfCorrectedMarkEarningPaid(req, res) {
+    try {
+      const payoutReference = String(req.body && req.body.payoutReference || '').trim();
+      if (!payoutReference) return res.status(400).json({ success: false, error: 'Enter the payout reference.' });
+      const earningRef = db.collection('codoAuthorEarnings').doc(req.params.earningId);
+      const result = await db.runTransaction(async tx => {
+        const snap = await tx.get(earningRef);
+        if (!snap.exists) return 'NOT_FOUND';
+        const earning = snap.data() || {};
+        if (earning.status === 'paid') return 'ALREADY_PAID';
+        if (earning.status !== 'pending') return 'NOT_PENDING';
+        tx.update(earningRef, {
+          status: 'paid', payoutReference: payoutReference.slice(0, 200),
+          paidAt: dfCodoTime(), markedPaidBy: req.dfCodoUser.uid
+        });
+        return 'PAID';
+      });
+      if (result === 'NOT_FOUND') return res.status(404).json({ success: false, error: 'Earnings record not found.' });
+      if (result === 'ALREADY_PAID') return res.status(409).json({ success: false, error: 'This earning has already been marked as paid.' });
+      if (result === 'NOT_PENDING') return res.status(400).json({ success: false, error: 'Only pending earnings can be marked as paid.' });
+      return res.json({ success: true, message: 'Earning marked as paid.' });
+    } catch (error) {
+      console.error('Doflow mark-paid override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to update earnings record.' });
+    }
+  }
+
+
+
+  // ---------------------------------------------------------
+  // 5A. PRIVATE BOOK PUBLISHING — metadata public, manuscript private
+  // ---------------------------------------------------------
+
+      }
+      const safeChapters = chapters.map((ch, index) => ({
+        id: String(ch.id || ch.chapterId || index),
+        chapterId: String(ch.chapterId || ch.id || index),
+        index,
+        title: String(ch.title || ('Chapter ' + (index + 1))).slice(0, 200),
+        content: ch.content,
+        locked: dfOverrideIsLocked(ch),
+        isLocked: dfOverrideIsLocked(ch)
+      }));
+      // Firestore documents are limited to 1 MiB. Leave headroom for document metadata.
+      const oversizedIndex = safeChapters.findIndex(ch => Buffer.byteLength(JSON.stringify(ch), 'utf8') > 850000);
+      if (oversizedIndex !== -1) {
+        return res.status(413).json({ success: false, error: 'Chapter ' + (oversizedIndex + 1) + ' is too large to store safely. Split that chapter into smaller chapters and upload again.' });
+      }
+
+      const authorRef = db.collection('authors').doc(uid);
+      const authorSnap = await authorRef.get();
+      if (!authorSnap.exists || authorSnap.data().isPro !== true) {
+        return res.status(403).json({ success: false, error: 'Verified author status is required to publish.' });
+      }
+      const existing = await db.collection('books').where('penName', '==', penName).get();
+      const takenByOther = existing.docs.some(doc => (doc.data() || {}).authorId !== uid);
+      if (takenByOther) return res.status(409).json({ success: false, error: 'That pen name is already in use by another author.' });
+
+      createdBookRef = db.collection('books').doc();
+      createdPrivateRef = db.collection('privateBookChapters').doc(createdBookRef.id);
+
+      // Create private metadata first, then store each chapter in its own document.
+      // The public book record is not created until all chapter writes succeed.
+      await createdPrivateRef.set({
+        bookId: createdBookRef.id,
+        authorId: uid,
+        chapterCount: safeChapters.length,
+        storageMode: 'chapter_documents',
+        migrationVersion: 2,
+        createdAt: dfCodoTime()
+      });
+
+      for (let offset = 0; offset < safeChapters.length; offset += 400) {
+        const batch = db.batch();
+        safeChapters.slice(offset, offset + 400).forEach(chapter => {
+          const chapterRef = createdPrivateRef.collection('chapters')
+            .doc(dfOverrideChapterDocId(chapter.index));
+          batch.set(chapterRef, chapter);
+        });
+        await batch.commit();
+      }
+
+      const batch = db.batch();
+      batch.set(createdBookRef, {
+        authorId: uid,
+        authorName: String(req.dfCodoUser.name || authorSnap.data().displayName || ''),
+        penName,
+        title,
+        cover,
+        color: String(body.color || '#8b5cf6'),
+        vibe: String(body.vibe || 'none'),
+        tipLink: String(body.tipLink || ''),
+        views: 0,
+        clicks: 0,
+        vibeActive: true,
+        chaptersPrivate: true,
+        chapterCount: safeChapters.length,
+        createdAt: dfCodoTime()
+      });
+      batch.set(authorRef, {
+        email: String(req.dfCodoUser.email || authorSnap.data().email || ''),
+        displayName: String(req.dfCodoUser.name || authorSnap.data().displayName || ''),
+        penName
+      }, { merge: true });
+      await batch.commit();
+      return res.json({ success: true, bookId: createdBookRef.id, message: 'Book published with private chapter-by-chapter storage.' });
+    } catch (error) {
+      console.error('Private book publishing:', error);
+      if (createdPrivateRef) {
+        try {
+          await dfOverrideDeleteChapterDocuments(createdPrivateRef.id);
+          await createdPrivateRef.delete();
+        } catch (cleanupError) {
+          console.error('Private chapter cleanup after failed publish:', cleanupError);
+        }
+      }
+      if (createdBookRef) {
+        try { await createdBookRef.delete(); } catch (_) {}
+      }
+      return res.status(500).json({ success: false, error: 'Unable to publish the book. Check the chapter sizes and try again.' });
+    }
+  });
+
+  // ---------------------------------------------------------
+  // 5B. BOOK DELETE — removes public metadata and private manuscript
+  // ---------------------------------------------------------
+  app.post('/api/author/books/:bookId/delete', dfCodoAuthenticate, async (req, res) => {
+    try {
+      const uid = req.dfCodoUser.uid;
+      const email = String(req.dfCodoUser.email || '').toLowerCase();
+      const bookRef = db.collection('books').doc(req.params.bookId);
+      const privateRef = db.collection('privateBookChapters').doc(req.params.bookId);
+      const [bookSnap, privateSnap] = await Promise.all([bookRef.get(), privateRef.get()]);
+      if (!bookSnap.exists) return res.status(404).json({ success: false, error: 'Book not found.' });
+      const book = bookSnap.data() || {};
+      if (book.authorId !== uid && email !== 'whytewritingservice@gmail.com') {
+        return res.status(403).json({ success: false, error: 'You are not allowed to delete this book.' });
+      }
+      // Delete private chapter documents first; support both the new subcollection
+      // format and the earlier single-document chapters array.
+      await dfOverrideDeleteChapterDocuments(req.params.bookId);
+      const batch = db.batch();
+      batch.delete(bookRef);
+      if (privateSnap.exists) batch.delete(privateRef);
+      await batch.commit();
+      return res.json({ success: true, message: 'Book and private manuscript deleted.' });
+    } catch (error) {
+      console.error('Book deletion override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to delete this book.' });
+    }
+  });
+
+  // ---------------------------------------------------------
+  // 6. PUBLIC CODO SETTINGS — only safe display configuration
+  // ---------------------------------------------------------
+  app.get('/api/codo-bills/public-settings', async (req, res) => {
+    try {
+      const settings = await dfCodoGetSettings();
+      return res.json({
+        success: true,
+        settings: {
+          enabled: settings.enabled,
+          billPriceGBP: settings.billPriceGBP,
+          currencyRates: settings.currencyRates,
+          bundles: [1, 3, 5, 10]
+        }
+      });
+    } catch (error) {
+      console.error('Public Codo settings:', error);
+      return res.status(500).json({ success: false, error: 'Unable to load Codo Bill settings.' });
+    }
+  });
+
+  async function dfReadAllDocuments(collectionRef, whereField, whereValue) {
+    const results = [];
+    let last = null;
+    for (;;) {
+      let query = collectionRef;
+      if (whereField) query = query.where(whereField, '==', whereValue);
+      query = query.orderBy(admin.firestore.FieldPath.documentId()).limit(500);
+      if (last) query = query.startAfter(last);
+      const page = await query.get();
+      if (page.empty) break;
+      results.push(...page.docs);
+      if (page.size < 500) break;
+      last = page.docs[page.docs.length - 1];
+    }
+    return results;
+  }
+
+  // Award route: retain totals and a funding-source ledger in the wallet.
+  async function dfCorrectedAwardBills(req, res) {
+    try {
+      const { readerUid, bills, source, reason } = req.body || {};
+      const amount = Number(bills);
+      const allowed = ['doflow', 'contest_sponsor', 'author'];
+      if (typeof readerUid !== 'string' || !readerUid.trim() || !Number.isInteger(amount) || amount < 1 || amount > 10000 || !allowed.includes(source)) {
+        return res.status(400).json({ success: false, error: 'Invalid reader, bill amount or award source.' });
+      }
+      const walletRef = db.collection('codoWallets').doc(readerUid);
+      const awardRef = db.collection('codoTransactions').doc();
+      await db.runTransaction(async tx => {
+        const snap = await tx.get(walletRef);
+
+        const wallet = snap.exists ? (snap.data() || {}) : {};
+        const bySource = Object.assign({ doflow: 0, contest_sponsor: 0, author: 0 }, wallet.awardedBySource || {});
+        const oldAwarded = Number(wallet.awardedBills || 0);
+        const known = Number(bySource.doflow || 0) + Number(bySource.contest_sponsor || 0) + Number(bySource.author || 0);
+        if (oldAwarded > known) bySource.legacy_unattributed = Math.max(Number(bySource.legacy_unattributed || 0), oldAwarded - known);
+        bySource[source] = Number(bySource[source] || 0) + amount;
+        tx.set(walletRef, {
+          uid: readerUid,
+          purchasedBills: Number(wallet.purchasedBills || 0),
+          awardedBills: oldAwarded + amount,
+          awardedBySource: bySource,
+          updatedAt: dfCodoTime()
+        }, { merge: true });
+        tx.set(awardRef, {
+          uid: readerUid, type: 'bill_award', source, billsAwarded: amount,
+          remainingBills: amount,
+          reason: String(reason || 'Codo Bill award').slice(0, 500),
+          status: 'successful', awardedBy: req.dfCodoUser.uid, createdAt: dfCodoTime()
+        });
+      });
+      return res.json({ success: true, message: amount + ' Codo Bills awarded.', awardId: awardRef.id });
+    } catch (error) {
+      console.error('Codo award override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to award Codo Bills.' });
+    }
+  }
+
+  async function dfCorrectedAwardHistory(req, res) {
+    try {
+      const docs = await dfReadAllDocuments(db.collection('codoTransactions'));
+      const awards = docs.filter(doc => { const d = doc.data() || {}; return d.uid === req.dfCodoUser.uid && d.type === 'bill_award'; }).map(doc => ({ id: doc.id, ...doc.data() }));
+      awards.sort((a, b) => (b.createdAt && b.createdAt.toMillis ? b.createdAt.toMillis() : 0) - (a.createdAt && a.createdAt.toMillis ? a.createdAt.toMillis() : 0));
+      return res.json({ success: true, awards });
+    } catch (error) {
+      console.error('Codo award history override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to load award history.' });
+    }
+  }
+
+  async function dfCorrectedAuthorEarnings(req, res) {
+    try {
+      const authorId = req.dfCodoUser.uid;
+      const authorSnap = await db.collection('authors').doc(authorId).get();
+      if (!authorSnap.exists) return res.status(404).json({ success: false, error: 'Author account not found.' });
+      const docs = await dfReadAllDocuments(db.collection('codoAuthorEarnings'));
+      const earnings = docs.filter(doc => (doc.data() || {}).authorId === authorId).map(doc => ({ id: doc.id, ...doc.data() }));
+      let totalGBP = 0, pendingGBP = 0, paidGBP = 0;
+      earnings.forEach(item => {
+        const amount = Number(item.authorShareGBP || 0);
+        totalGBP += amount;
+        if (item.status === 'paid') paidGBP += amount;
+        else if (item.status === 'pending') pendingGBP += amount;
+      });
+      earnings.sort((a, b) => (b.createdAt && b.createdAt.toMillis ? b.createdAt.toMillis() : 0) - (a.createdAt && a.createdAt.toMillis ? a.createdAt.toMillis() : 0));
+      return res.json({ success: true, earnings: { totalGBP: dfCodoRoundMoney(totalGBP), pendingGBP: dfCodoRoundMoney(pendingGBP), paidGBP: dfCodoRoundMoney(paidGBP) }, transactions: earnings });
+    } catch (error) {
+      console.error('Author Codo earnings override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to load author earnings.' });
+    }
+  }
+
+  async function dfCorrectedAdminEarnings(req, res) {
+    try {
+      const docs = await dfReadAllDocuments(db.collection('codoAuthorEarnings'));
+      const records = docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      records.sort((a, b) => (b.createdAt && b.createdAt.toMillis ? b.createdAt.toMillis() : 0) - (a.createdAt && a.createdAt.toMillis ? a.createdAt.toMillis() : 0));
+      return res.json({ success: true, records });
+    } catch (error) {
+      console.error('Admin Codo earnings override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to load earnings records.' });
+    }
+  }
+
+  async function dfCorrectedFinance(req, res) {
+    try {
+      const [paymentDocs, earningDocs, walletDocs] = await Promise.all([
+        dfReadAllDocuments(db.collection('codoTransactions'), 'type', 'bill_purchase'),
+        dfReadAllDocuments(db.collection('codoAuthorEarnings')),
+        dfReadAllDocuments(db.collection('codoWallets'))
+      ]);
+      let successfulPayments = 0, pendingPayments = 0, grossPaymentsGBP = 0;
+      paymentDocs.forEach(doc => {
+        const item = doc.data() || {};
+        if (item.status === 'successful') {
+          successfulPayments++;
+          grossPaymentsGBP += Number(item.bundle || 0) * Number(item.billPriceGBP || 1);
+        } else if (item.status === 'pending') pendingPayments++;
+      });
+      let pendingAuthorGBP = 0, paidAuthorGBP = 0, platformShareGBP = 0;
+      earningDocs.forEach(doc => {
+        const item = doc.data() || {};
+        const authorAmount = Number(item.authorShareGBP || 0);
+        platformShareGBP += Number(item.platformShareGBP || 0);
+        if (item.status === 'paid') paidAuthorGBP += authorAmount;
+        else if (item.status === 'pending') pendingAuthorGBP += authorAmount;
+      });
+      let purchasedBillsOutstanding = 0, awardedBillsOutstanding = 0;
+      walletDocs.forEach(doc => {
+        const wallet = doc.data() || {};
+        purchasedBillsOutstanding += Number(wallet.purchasedBills || 0);
+        awardedBillsOutstanding += Number(wallet.awardedBills || 0);
+      });
+      return res.json({ success: true, finance: {
+        successfulPayments, pendingPayments,
+        grossPaymentsGBP: dfCodoRoundMoney(grossPaymentsGBP),
+        pendingAuthorGBP: dfCodoRoundMoney(pendingAuthorGBP),
+        paidAuthorGBP: dfCodoRoundMoney(paidAuthorGBP),
+        recordedPlatformShareGBP: dfCodoRoundMoney(platformShareGBP),
+        purchasedBillsOutstanding, awardedBillsOutstanding,
+        recordsIncluded: { payments: paymentDocs.length, earnings: earningDocs.length, wallets: walletDocs.length },
+        note: 'All stored records are included. Figures are gross of Flutterwave/processor fees and external settlement adjustments.'
+      } });
+    } catch (error) {
+      console.error('Codo finance override:', error);
+      return res.status(500).json({ success: false, error: 'Unable to load Codo finance summary.' });
+    }
+  }
+
+  // Patch the existing routes, preserving their existing authentication middleware
+  // except where anonymous public reading is explicitly required.
+  dfReplaceRouteHandler('post', '/api/codo-bills/unlock-package', dfCorrectedUnlockPackage);
+  dfReplaceRouteHandler('post', '/api/codo-bills/verify-payment', dfCorrectedVerifyPayment);
+  dfReplaceRouteHandler('get', '/api/books/:bookId/chapters', dfCorrectedReadChapters);
+  dfReplaceRouteHandler('get', '/api/codo-bills/access/:bookId', dfCorrectedAccessLookup);
+  dfReplaceRouteHandler('post', '/api/admin/codo-bills/earnings/:earningId/mark-paid', dfCorrectedMarkEarningPaid);
+  dfReplaceRouteHandler('post', '/api/admin/codo-bills/award', dfCorrectedAwardBills);
+  dfReplaceRouteHandler('get', '/api/codo-bills/awards', dfCorrectedAwardHistory);
+  dfReplaceRouteHandler('get', '/api/codo-bills/author/earnings', dfCorrectedAuthorEarnings);
+  dfReplaceRouteHandler('get', '/api/admin/codo-bills/earnings', dfCorrectedAdminEarnings);
+  dfReplaceRouteHandler('get', '/api/admin/codo-bills/finance', dfCorrectedFinance);
+  dfReplaceRouteAuth('get', '/api/books/:bookId/chapters', dfOptionalFirebaseAuth);
+  dfReplaceRouteAuth('get', '/api/codo-bills/access/:bookId', dfOptionalFirebaseAuth);
+
+  console.log('Doflownovels consolidated override installed: Codo Bills routes patched; private chapter documents enabled; original webhooks/admin unlock/server startup preserved.');
+})();
+
 
 // --- 5. START SERVER ---
 const PORT = process.env.PORT || 10000;
