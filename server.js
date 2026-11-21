@@ -1817,6 +1817,256 @@ app.get(
 // =========================================================
 
 
+/* =========================================================
+   DOFLOWNOVELS — CHAPTER PRIVACY UPGRADE
+   PRIVATE CHAPTER STORAGE AND SECURE READING
+   ========================================================= */
+
+// ---------------------------------------------------------
+// A. ADMIN: CHECK WHETHER A BOOK HAS BEEN MIGRATED
+// ---------------------------------------------------------
+
+app.get(
+    '/api/admin/books/:bookId/chapter-migration',
+    dfCodoAuthenticate,
+    dfCodoRequireAdmin,
+    async (req, res) => {
+        try {
+            const bookRef = db.collection('books').doc(req.params.bookId);
+            const privateRef = db.collection('privateBookChapters').doc(req.params.bookId);
+
+            const [bookSnapshot, privateSnapshot] = await Promise.all([
+                bookRef.get(),
+                privateRef.get()
+            ]);
+
+            if (!bookSnapshot.exists) {
+                return res.status(404).json({
+                    success: false,
+                    error: 'Book not found.'
+                });
+            }
+
+            const book = bookSnapshot.data();
+
+            res.json({
+                success: true,
+                bookId: req.params.bookId,
+                publicChaptersPresent: Array.isArray(book.chapters),
+                privateCopyPresent: privateSnapshot.exists,
+                chapterCount: Array.isArray(book.chapters)
+                    ? book.chapters.length
+                    : (
+                        privateSnapshot.exists &&
+                        Array.isArray(privateSnapshot.data().chapters)
+                            ? privateSnapshot.data().chapters.length
+                            : 0
+                    )
+            });
+        } catch (error) {
+            console.error('Chapter migration status:', error);
+            res.status(500).json({
+                success: false,
+                error: 'Unable to check migration status.'
+            });
+        }
+    }
+);
+
+// ---------------------------------------------------------
+// B. ADMIN: SAFELY MOVE ONE BOOK'S CHAPTERS
+// ---------------------------------------------------------
+
+app.post(
+    '/api/admin/books/:bookId/migrate-chapters',
+    dfCodoAuthenticate,
+    dfCodoRequireAdmin,
+    async (req, res) => {
+        try {
+            const bookId = req.params.bookId;
+
+            const bookRef = db.collection('books').doc(bookId);
+            const privateRef = db.collection('privateBookChapters').doc(bookId);
+
+            const [bookSnapshot, privateSnapshot] = await Promise.all([
+                bookRef.get(),
+                privateRef.get()
+            ]);
+
+            if (!bookSnapshot.exists) {
+                return res.status(404).json({
+                    success: false,
+                    error: 'Book not found.'
+                });
+            }
+
+            if (privateSnapshot.exists) {
+                return res.status(409).json({
+                    success: false,
+                    error: 'A private chapter copy already exists. No changes were made.'
+                });
+            }
+
+            const book = bookSnapshot.data();
+
+            if (!Array.isArray(book.chapters)) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'No public chapters found to migrate.'
+                });
+            }
+
+            // Preserve every chapter field and its original array position.
+            const chapters = book.chapters.map(chapter => ({
+                ...chapter
+            }));
+
+            const batch = db.batch();
+
+            // Copy chapters privately, then remove the public copy
+            // in the SAME atomic Firestore batch.
+            batch.set(privateRef, {
+                bookId,
+                authorId: book.authorId || null,
+                chapters,
+                migratedAt: dfCodoTime(),
+                migratedBy: req.dfCodoUser.uid,
+                migrationVersion: 1
+            });
+
+            batch.update(bookRef, {
+                chapters: admin.firestore.FieldValue.delete(),
+                chaptersPrivate: true,
+                chapterCount: chapters.length,
+                chaptersMigratedAt: dfCodoTime()
+            });
+
+            await batch.commit();
+
+            res.json({
+                success: true,
+                message: 'Chapter content moved into private storage.',
+                bookId,
+                chaptersMigrated: chapters.length
+            });
+
+        } catch (error) {
+            console.error('Chapter migration error:', error);
+
+            res.status(500).json({
+                success: false,
+                error: 'Chapter migration failed. Check backend logs.'
+            });
+        }
+    }
+);
+
+// ---------------------------------------------------------
+// C. SECURE CHAPTER READING ENDPOINT
+// ---------------------------------------------------------
+
+app.get(
+    '/api/books/:bookId/chapters',
+    dfCodoAuthenticate,
+    async (req, res) => {
+        try {
+            const uid = req.dfCodoUser.uid;
+            const email = String(req.dfCodoUser.email || '').toLowerCase();
+
+            const isPlatformAdmin =
+                email === 'whytewritingservice@gmail.com';
+
+            const bookRef = db.collection('books').doc(req.params.bookId);
+            const privateRef = db.collection('privateBookChapters').doc(req.params.bookId);
+
+            const [bookSnapshot, privateSnapshot] = await Promise.all([
+                bookRef.get(),
+                privateRef.get()
+            ]);
+
+            if (!bookSnapshot.exists) {
+                return res.status(404).json({
+                    success: false,
+                    error: 'Book not found.'
+                });
+            }
+
+            const book = bookSnapshot.data();
+
+            if (!privateSnapshot.exists) {
+                return res.status(409).json({
+                    success: false,
+                    error: 'This book has not yet been migrated to private chapter storage.'
+                });
+            }
+
+            const privateData = privateSnapshot.data();
+            const chapters = Array.isArray(privateData.chapters)
+                ? privateData.chapters
+                : [];
+
+            const isAuthor = book.authorId === uid;
+
+            let unlockedIndexes = [];
+
+            if (!isPlatformAdmin && !isAuthor) {
+                const accessSnapshot = await db
+                    .collection('codoPackageAccess')
+                    .doc(`${uid}_${req.params.bookId}`)
+                    .get();
+
+                if (accessSnapshot.exists) {
+                    unlockedIndexes =
+                        accessSnapshot.data().chapterIndexes || [];
+                }
+            }
+
+            const safeChapters = chapters.map((chapter, index) => {
+                const locked =
+                    chapter.locked === true ||
+                    chapter.isLocked === true;
+
+                const canRead =
+                    isPlatformAdmin ||
+                    isAuthor ||
+                    !locked ||
+                    unlockedIndexes.includes(index);
+
+                return {
+                    index,
+                    title: chapter.title || `Chapter ${index + 1}`,
+                    locked,
+                    content: canRead
+                        ? (chapter.content || '')
+                        : null,
+                    hasAccess: canRead
+                };
+            });
+
+            res.json({
+                success: true,
+                bookId: req.params.bookId,
+                unlimitedAccess: isPlatformAdmin,
+                chapters: safeChapters
+            });
+
+        } catch (error) {
+            console.error('Secure chapter reading:', error);
+
+            res.status(500).json({
+                success: false,
+                error: 'Unable to load chapters.'
+            });
+        }
+    }
+);
+
+// =========================================================
+// END CHAPTER PRIVACY UPGRADE
+// =========================================================
+
+
+
 // --- 5. START SERVER ---
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
