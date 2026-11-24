@@ -1,866 +1,775 @@
 'use strict';
 
+require('dotenv').config();
+
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
-const crypto = require('crypto');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const admin = require('firebase-admin');
 
-const ADMIN_EMAIL = 'whytewritingservice@gmail.com';
-const FRONTEND_URL = 'https://doflownovels.netlify.app/';
-
 const app = express();
-app.disable('x-powered-by');
+const PORT = Number(process.env.PORT || 10000);
 
-app.use(cors());
-app.use(express.json({
-  limit: '1mb',
-  verify: (req, res, buffer) => {
-    req.rawBody = buffer;
+// Trust Render / reverse proxy for accurate client IP & rate limiting
+app.set('trust proxy', 1);
+
+// ---------------------------------------------------------------------------
+// Firebase Admin Initialization
+// ---------------------------------------------------------------------------
+function initFirebaseAdmin() {
+  if (admin.apps.length > 0) {
+    return admin.app();
   }
-}));
 
-let db;
-let auth;
+  const rawServiceAccount =
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
+    process.env.FIREBASE_SERVICE_ACCOUNT ||
+    '';
+
+  if (rawServiceAccount.trim()) {
+    const parsed = JSON.parse(rawServiceAccount);
+    if (parsed.private_key && typeof parsed.private_key === 'string') {
+      parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+    }
+    admin.initializeApp({
+      credential: admin.credential.cert(parsed),
+      projectId: process.env.FIREBASE_PROJECT_ID || parsed.project_id || 'doflownovels',
+    });
+    return admin.app();
+  }
+
+  const projectId = process.env.FIREBASE_PROJECT_ID || 'doflownovels';
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || '';
+  const privateKey = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+
+  if (clientEmail && privateKey) {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId,
+        clientEmail,
+        privateKey,
+      }),
+      projectId,
+    });
+    return admin.app();
+  }
+
+  // Fallback to Application Default Credentials if present in environment
+  admin.initializeApp({
+    credential: admin.credential.applicationDefault(),
+    projectId,
+  });
+  return admin.app();
+}
+
+let firebaseReady = false;
+let db = null;
 
 try {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-  serviceAccount.private_key = String(serviceAccount.private_key)
-    .replace(/\\n/g, '\n');
-
-  if (!admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-  }
-
+  initFirebaseAdmin();
   db = admin.firestore();
-  auth = admin.auth();
-
-  console.log('Firebase Admin initialized successfully.');
-} catch (error) {
-  console.error(
-    'FATAL ERROR: Firebase Admin initialization failed. Check FIREBASE_SERVICE_ACCOUNT.',
-    error
-  );
-
-  process.exit(1);
+  firebaseReady = true;
+} catch (err) {
+  console.error('[BOOT] Firebase Admin initialization warning:', err.message);
 }
 
-const serverTimestamp = () =>
-  admin.firestore.FieldValue.serverTimestamp();
+// ---------------------------------------------------------------------------
+// Configuration & Allowed Origins
+// ---------------------------------------------------------------------------
+const ADMIN_EMAIL = String(
+  process.env.ADMIN_EMAIL || 'whytewritingservice@gmail.com'
+)
+  .trim()
+  .toLowerCase();
 
-const roundMoney = value =>
-  Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+const FLW_SECRET_KEY = String(process.env.FLW_SECRET_KEY || '').trim();
+const FLW_SECRET_HASH = String(process.env.FLW_SECRET_HASH || '').trim();
+const FLW_VERIFY_BASE_URL = String(
+  process.env.FLW_VERIFY_BASE_URL || 'https://api.flutterwave.com/v3'
+).replace(/\/+$/, '');
 
-async function verifyFirebaseToken(req, res, next) {
-  try {
-    const header = req.headers.authorization || '';
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://doflownovels.netlify.app',
+  'https://doflownovels.firebaseapp.com',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:5500',
+];
 
-    if (!header.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Login required.'
-      });
-    }
+const extraOrigins = String(process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-    req.user = await auth.verifyIdToken(
-      header.substring(7),
-      true
-    );
+const allowedOrigins = new Set([...DEFAULT_ALLOWED_ORIGINS, ...extraOrigins]);
 
-    return next();
-  } catch (error) {
-    console.error('Firebase token verification failed:', error?.code);
-
-    return res.status(401).json({
-      success: false,
-      error: 'Invalid or expired login.'
-    });
-  }
-}
-
-function requireAdmin(req, res, next) {
-  const email = String(req.user?.email || '').toLowerCase();
-
-  if (email !== ADMIN_EMAIL) {
-    return res.status(403).json({
-      success: false,
-      error: 'Administrator access only.'
-    });
-  }
-
-  return next();
-}
-
-app.get('/', (req, res) => {
-  res.json({
-    success: true,
-    service: 'Doflownovels Backend',
-    status: 'running'
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({
-    success: true,
-    status: 'healthy'
-  });
-});
-// =========================================================
-// OLD FLUTTERWAVE AUTHOR UNLOCK WEBHOOK
-// =========================================================
-
-app.post('/api/doflow-unlock', async (req, res) => {
-  try {
-    const payload = req.body || {};
-    const txRef = payload?.data?.tx_ref;
-
-    if (!txRef || !String(txRef).startsWith('doflow_')) {
-      return res.status(200).json({
-        status: 'ignored',
-        message: 'Not a Doflow transaction.'
-      });
-    }
-
-    const transactionId = payload.data.id;
-    const customerEmail = payload?.data?.customer?.email;
-
-    if (!transactionId || !customerEmail) {
-      return res.status(400).json({
-        error: 'Invalid webhook payload.'
-      });
-    }
-
-    const flutterwaveResponse = await fetch(
-      `https://api.flutterwave.com/v3/transactions/${transactionId}/verify`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`
-        }
-      }
-    );
-
-    const flutterwaveData = await flutterwaveResponse.json();
-
-    const paymentSuccessful =
-      flutterwaveData?.status === 'success' &&
-      flutterwaveData?.data?.status === 'successful';
-
-    if (!paymentSuccessful) {
-      return res.status(400).json({
-        error: 'Payment verification failed.'
-      });
-    }
-
-    const authorsSnapshot = await db
-      .collection('authors')
-      .where('email', '==', customerEmail)
-      .get();
-
-    if (authorsSnapshot.empty) {
-      return res.status(404).json({
-        error: 'Author not found.'
-      });
-    }
-
-    const batch = db.batch();
-
-    authorsSnapshot.forEach(document => {
-      batch.update(document.ref, {
-        isPro: true,
-        unlockedAt: serverTimestamp()
-      });
-    });
-
-    await batch.commit();
-
-    return res.json({
-      status: 'success',
-      message: 'Author unlocked.'
-    });
-  } catch (error) {
-    console.error('Doflow unlock webhook error:', error);
-
-    return res.status(500).json({
-      error: 'Internal server error.'
-    });
-  }
-});
-
-// =========================================================
-// ADMIN MANUAL UNLOCK
-// =========================================================
-
-app.post(
-  '/api/admin/unlock',
-  verifyFirebaseToken,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const targetUid = String(req.body?.targetUid || '').trim();
-
-      if (!targetUid) {
-        return res.status(400).json({
-          error: 'Missing targetUid.'
-        });
-      }
-
-      const userRecord = await auth.getUser(targetUid);
-
-      await db.collection('authors').doc(targetUid).set({
-        email: userRecord.email || '',
-        displayName: userRecord.displayName || '',
-        isPro: true,
-        unlockedByAdmin: true,
-        unlockedAt: serverTimestamp()
-      }, { merge: true });
-
-      return res.json({
-        success: true,
-        message: 'Author unlocked.'
-      });
-    } catch (error) {
-      console.error('Admin unlock error:', error);
-
-      return res.status(500).json({
-        error: 'Could not unlock author.'
-      });
-    }
-  }
-);
-// =========================================================
-// CODO BILL SETTINGS
-// =========================================================
-
-const codoSettingsRef = db
-  .collection('platformSettings')
-  .doc('codoBills');
-
-async function getCodoSettings() {
-  const snapshot = await codoSettingsRef.get();
-  const saved = snapshot.exists ? snapshot.data() : {};
-
-  return {
-    enabled: saved.enabled !== false,
-    billPriceGBP: Number(saved.billPriceGBP || 1),
-    currencyRates: {
-      GBP: 1,
-      ...(saved.currencyRates || {})
-    },
-    bundles: [1, 3, 5, 10]
+function logEvent(level, event, details = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...details,
   };
+  if (level === 'error') {
+    console.error(JSON.stringify(entry));
+  } else {
+    console.log(JSON.stringify(entry));
+  }
 }
 
-app.get(
-  '/api/admin/codo-bills/settings',
-  verifyFirebaseToken,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      return res.json({
-        success: true,
-        settings: await getCodoSettings()
-      });
-    } catch (error) {
-      console.error('Codo settings error:', error);
-
-      return res.status(500).json({
-        success: false,
-        error: 'Unable to load Codo settings.'
-      });
-    }
-  }
+// ---------------------------------------------------------------------------
+// Security, CORS, Rate Limiting & Body Parsing
+// ---------------------------------------------------------------------------
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
 );
 
-app.put(
-  '/api/admin/codo-bills/settings',
-  verifyFirebaseToken,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const body = req.body || {};
-      const update = {};
-
-      if (body.enabled !== undefined) {
-        if (typeof body.enabled !== 'boolean') {
-          return res.status(400).json({
-            error: 'Invalid enabled setting.'
-          });
-        }
-
-        update.enabled = body.enabled;
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Allow server-to-server / webhook / health probes with no Origin header
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.has(origin)) {
+        return callback(null, true);
       }
-
-      if (body.billPriceGBP !== undefined) {
-        const price = Number(body.billPriceGBP);
-
-        if (!Number.isFinite(price) || price <= 0) {
-          return res.status(400).json({
-            error: 'Invalid bill price.'
-          });
-        }
-
-        update.billPriceGBP = roundMoney(price);
-      }
-
-      if (body.currencyRates !== undefined) {
-        if (
-          !body.currencyRates ||
-          typeof body.currencyRates !== 'object' ||
-          Array.isArray(body.currencyRates)
-        ) {
-          return res.status(400).json({
-            error: 'Invalid currency rates.'
-          });
-        }
-
-        const rates = { GBP: 1 };
-
-        for (const [rawCode, rawRate] of Object.entries(body.currencyRates)) {
-          const code = String(rawCode).toUpperCase();
-          const rate = Number(rawRate);
-
-          if (
-            !/^[A-Z]{3}$/.test(code) ||
-            !Number.isFinite(rate) ||
-            rate <= 0
-          ) {
-            return res.status(400).json({
-              error: 'Invalid currency rate.'
-            });
-          }
-
-          if (code !== 'GBP') {
-            rates[code] = rate;
-          }
-        }
-
-        update.currencyRates = rates;
-      }
-
-      update.updatedAt = serverTimestamp();
-      update.updatedBy = req.user.uid;
-
-      await codoSettingsRef.set(update, { merge: true });
-
-      return res.json({
-        success: true,
-        message: 'Codo settings updated.',
-        settings: await getCodoSettings()
-      });
-    } catch (error) {
-      console.error('Codo settings update error:', error);
-
-      return res.status(500).json({
-        success: false,
-        error: 'Unable to update Codo settings.'
-      });
-    }
-  }
+      logEvent('warn', 'cors_blocked', { origin });
+      return callback(new Error('Origin not allowed by CORS policy'), false);
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'verif-hash'],
+    credentials: true,
+    maxAge: 86400,
+  })
 );
 
-// =========================================================
-// CODO WALLET
-// =========================================================
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_MAX_PER_MIN || 120),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'Too many requests. Please slow down.' },
+});
 
-app.get(
-  '/api/codo-bills/wallet',
-  verifyFirebaseToken,
-  async (req, res) => {
-    try {
-      const uid = req.user.uid;
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.WEBHOOK_RATE_LIMIT_MAX_PER_MIN || 180),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'Webhook rate limit exceeded.' },
+});
 
-      const [walletSnapshot, transactionsSnapshot] = await Promise.all([
-        db.collection('codoWallets').doc(uid).get(),
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.ADMIN_RATE_LIMIT_MAX_PER_MIN || 60),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'Admin rate limit exceeded.' },
+});
 
-        db.collection('codoTransactions')
-          .where('uid', '==', uid)
-          .limit(50)
-          .get()
-      ]);
+app.use(globalLimiter);
 
-      const wallet = walletSnapshot.exists
-        ? walletSnapshot.data()
-        : {};
-
-      const purchasedBills = Number(wallet.purchasedBills || 0);
-      const awardedBills = Number(wallet.awardedBills || 0);
-
-      const transactions = transactionsSnapshot.docs.map(document => ({
-        id: document.id,
-        ...document.data()
-      }));
-
-      transactions.sort((a, b) => {
-        const first = a.createdAt?.toMillis?.() || 0;
-        const second = b.createdAt?.toMillis?.() || 0;
-        return second - first;
-      });
-
-      return res.json({
-        success: true,
-        wallet: {
-          purchasedBills,
-          awardedBills,
-          totalBills: purchasedBills + awardedBills
-        },
-        transactions
-      });
-    } catch (error) {
-      console.error('Codo wallet error:', error);
-
-      return res.status(500).json({
-        success: false,
-        error: 'Unable to load Codo wallet.'
-      });
-    }
-  }
+// Capture rawBody for webhook signature checks while parsing JSON with bounded limit
+app.use(
+  express.json({
+    limit: process.env.JSON_BODY_LIMIT || '256kb',
+    verify(req, _res, buf) {
+      req.rawBody = buf;
+    },
+  })
 );
-// =========================================================
-// CODO CHECKOUT
-// =========================================================
+// ---------------------------------------------------------------------------
+// Helper Functions: Auth, Signature Verification & Flutterwave API Check
+// ---------------------------------------------------------------------------
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
-app.post(
-  '/api/codo-bills/checkout',
-  verifyFirebaseToken,
-  async (req, res) => {
-    let paymentRef = null;
-
-    try {
-      if (!process.env.FLW_SECRET_KEY) {
-        return res.status(503).json({
-          success: false,
-          error: 'Flutterwave is not configured.'
-        });
-      }
-
-      const settings = await getCodoSettings();
-
-      if (!settings.enabled) {
-        return res.status(403).json({
-          success: false,
-          error: 'Codo Bill purchases are temporarily disabled.'
-        });
-      }
-
-      const bundle = Number(req.body?.bundle);
-      const currency = String(req.body?.currency || 'GBP').toUpperCase();
-
-      if (![1, 3, 5, 10].includes(bundle)) {
-        return res.status(400).json({
-          success: false,
-          error: 'Choose 1, 3, 5 or 10 Codo Bills.'
-        });
-      }
-
-      const email = req.user.email;
-
-      if (!email) {
-        return res.status(400).json({
-          success: false,
-          error: 'A verified email is required.'
-        });
-      }
-
-      const rate = Number(settings.currencyRates[currency]);
-
-      if (!Number.isFinite(rate) || rate <= 0) {
-        return res.status(400).json({
-          success: false,
-          error: `Checkout in ${currency} has not been configured.`
-        });
-      }
-
-      const amount = roundMoney(
-        bundle * settings.billPriceGBP * rate
-      );
-
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid payment amount.'
-        });
-      }
-
-      const txRef = `codo_${req.user.uid}_${Date.now()}_${crypto
-        .randomBytes(6)
-        .toString('hex')}`;
-
-      paymentRef = db.collection('codoTransactions').doc(txRef);
-
-      await paymentRef.set({
-        uid: req.user.uid,
-        email,
-        txRef,
-        bundle,
-        amount,
-        currency,
-        billPriceGBP: settings.billPriceGBP,
-        exchangeRate: rate,
-        type: 'bill_purchase',
-        status: 'pending',
-        createdAt: serverTimestamp()
-      });
-
-      const flutterwaveResponse = await fetch(
-        'https://api.flutterwave.com/v3/payments',
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            tx_ref: txRef,
-            amount,
-            currency,
-            redirect_url: FRONTEND_URL,
-            customer: {
-              email,
-              name: req.user.name || email
-            },
-            customizations: {
-              title: 'Doflownovels Codo Bills',
-              description: `${bundle} Codo Bill${bundle === 1 ? '' : 's'}`
-            },
-            meta: {
-              uid: req.user.uid,
-              product: 'doflownovels_codo_bills',
-              bundle
-            }
-          })
-        }
-      );
-
-      const paymentData = await flutterwaveResponse.json();
-
-      if (
-        !flutterwaveResponse.ok ||
-        paymentData?.status !== 'success' ||
-        !paymentData?.data?.link
-      ) {
-        await paymentRef.update({
-          status: 'initialization_failed',
-          updatedAt: serverTimestamp()
-        });
-
-        return res.status(502).json({
-          success: false,
-          error: 'Flutterwave checkout could not be started.'
-        });
-      }
-
-      await paymentRef.update({
-        checkoutUrl: paymentData.data.link,
-        checkoutCreatedAt: serverTimestamp()
-      });
-
-      return res.json({
-        success: true,
-        txRef,
-        checkoutUrl: paymentData.data.link,
-        amount,
-        currency,
-        bills: bundle
-      });
-    } catch (error) {
-      console.error('Codo checkout error:', error);
-
-      if (paymentRef) {
-        try {
-          await paymentRef.update({
-            status: 'initialization_error',
-            updatedAt: serverTimestamp()
-          });
-        } catch (_) {}
-      }
-
-      return res.status(500).json({
-        success: false,
-        error: 'Unable to start Codo Bill checkout.'
-      });
-    }
+function verifyWebhookSignature(req) {
+  // Flutterwave webhooks commonly send `verif-hash` matching FLW_SECRET_HASH
+  const verifHash = String(req.headers['verif-hash'] || '').trim();
+  if (FLW_SECRET_HASH) {
+    return timingSafeEqualStr(verifHash, FLW_SECRET_HASH);
   }
-);
-// =========================================================
-// CODO PAYMENT VERIFICATION
-// =========================================================
-
-app.post(
-  '/api/codo-bills/verify-payment',
-  verifyFirebaseToken,
-  async (req, res) => {
-    try {
-      const transactionId = String(req.body?.transactionId || '').trim();
-      const txRef = String(req.body?.txRef || '').trim();
-
-      if (!transactionId || !txRef) {
-        return res.status(400).json({
-          success: false,
-          error: 'Transaction ID and reference are required.'
-        });
-      }
-
-      if (!txRef.startsWith(`codo_${req.user.uid}_`)) {
-        return res.status(403).json({
-          success: false,
-          error: 'This payment does not belong to your account.'
-        });
-      }
-
-      const paymentRef = db.collection('codoTransactions').doc(txRef);
-      const paymentSnapshot = await paymentRef.get();
-
-      if (!paymentSnapshot.exists) {
-        return res.status(404).json({
-          success: false,
-          error: 'Payment record not found.'
-        });
-      }
-
-      const payment = paymentSnapshot.data();
-
-      if (payment.uid !== req.user.uid) {
-        return res.status(403).json({
-          success: false,
-          error: 'Payment ownership check failed.'
-        });
-      }
-
-      if (payment.status === 'successful') {
-        return res.json({
-          success: true,
-          alreadyProcessed: true,
-          billsAdded: payment.bundle
-        });
-      }
-
-      const flutterwaveResponse = await fetch(
-        `https://api.flutterwave.com/v3/transactions/${transactionId}/verify`,
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`
-          }
-        }
-      );
-
-      const flutterwaveData = await flutterwaveResponse.json();
-
-      const isValid =
-        flutterwaveData?.status === 'success' &&
-        flutterwaveData?.data?.status === 'successful' &&
-        flutterwaveData?.data?.tx_ref === txRef &&
-        Number(flutterwaveData?.data?.amount) === Number(payment.amount) &&
-        String(flutterwaveData?.data?.currency).toUpperCase() === payment.currency;
-
-      if (!isValid) {
-        await paymentRef.update({
-          status: 'verification_failed',
-          updatedAt: serverTimestamp()
-        });
-
-        return res.status(400).json({
-          success: false,
-          error: 'Payment verification failed.'
-        });
-      }
-
-      await db.runTransaction(async transaction => {
-        const freshPayment = await transaction.get(paymentRef);
-        const paymentData = freshPayment.data();
-
-        if (paymentData.status === 'successful') {
-          return;
-        }
-
-        const walletRef = db.collection('codoWallets').doc(req.user.uid);
-        const walletSnapshot = await transaction.get(walletRef);
-
-        const currentPurchased = walletSnapshot.exists
-          ? Number(walletSnapshot.data().purchasedBills || 0)
-          : 0;
-
-        transaction.set(walletRef, {
-          uid: req.user.uid,
-          purchasedBills: currentPurchased + Number(payment.bundle),
-          updatedAt: serverTimestamp()
-        }, { merge: true });
-
-        transaction.update(paymentRef, {
-          status: 'successful',
-          flutterwaveTransactionId: transactionId,
-          completedAt: serverTimestamp(),
-          updatedAt: serverTimestamp()
-        });
-
-        transaction.set(db.collection('codoTransactions').doc(), {
-          uid: req.user.uid,
-          txRef,
-          type: 'bill_purchase_completed',
-          bills: Number(payment.bundle),
-          amount: payment.amount,
-          currency: payment.currency,
-          status: 'successful',
-          createdAt: serverTimestamp()
-        });
-      });
-
-      return res.json({
-        success: true,
-        billsAdded: payment.bundle
-      });
-    } catch (error) {
-      console.error('Codo payment verification error:', error);
-
-      return res.status(500).json({
-        success: false,
-        error: 'Unable to verify Codo Bill payment.'
-      });
-    }
+  // Optional fallback if HMAC-SHA256 signature is configured
+  const hmacSecret = String(process.env.FLW_WEBHOOK_HMAC_SECRET || '').trim();
+  const sigHeader = String(req.headers['x-flw-signature'] || '').trim();
+  if (hmacSecret && sigHeader && req.rawBody) {
+    const expected = crypto
+      .createHmac('sha256', hmacSecret)
+      .update(req.rawBody)
+      .digest('hex');
+    return timingSafeEqualStr(sigHeader, expected);
   }
-);
+  return false;
+}
 
-// =========================================================
-// CODO WEBHOOK
-// =========================================================
+async function fetchVerifiedFlutterwaveTransaction(transactionId) {
+  if (!FLW_SECRET_KEY) {
+    throw new Error('FLW_SECRET_KEY is not configured on server');
+  }
+  const safeId = encodeURIComponent(String(transactionId).trim());
+  const url = `${FLW_VERIFY_BASE_URL}/transactions/${safeId}/verify`;
 
-app.post('/api/codo-bills/webhook', async (req, res) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+
   try {
-    const secretHash = process.env.FLW_SECRET_HASH;
-    const signature = req.headers['verif-hash'];
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${FLW_SECRET_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      signal: controller.signal,
+    });
 
-    if (secretHash && signature !== secretHash) {
-      return res.status(401).end();
+    if (!response.ok) {
+      throw new Error(`Flutterwave verify HTTP ${response.status}`);
     }
 
-    const payload = req.body || {};
-    const txRef = payload?.data?.tx_ref;
+    const payload = await response.json();
+    if (payload.status !== 'success' || !payload.data) {
+      throw new Error('Flutterwave verification returned unsuccessful status');
+    }
+    return payload.data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
-    if (!txRef || !String(txRef).startsWith('codo_')) {
-      return res.status(200).json({
-        status: 'ignored'
+async function requireVerifiedAdmin(req, res, next) {
+  try {
+    if (!firebaseReady || !db) {
+      return res.status(503).json({ ok: false, error: 'Database unavailable' });
+    }
+
+    const authHeader = String(req.headers.authorization || '');
+    if (!authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ ok: false, error: 'Missing bearer token' });
+    }
+
+    const idToken = authHeader.slice('Bearer '.length).trim();
+    if (!idToken) {
+      return res.status(401).json({ ok: false, error: 'Empty bearer token' });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken, true);
+    const email = String(decoded.email || '').trim().toLowerCase();
+    const emailVerified = Boolean(decoded.email_verified);
+    const isAdminClaim = decoded.admin === true || decoded.role === 'admin';
+
+    const userDocSnap = await db.collection('users').doc(decoded.uid).get();
+    const userDoc = userDocSnap.exists ? userDocSnap.data() : {};
+    const docRole = String(userDoc.role || '').toLowerCase();
+
+    const authorizedOwnerEmail = email === ADMIN_EMAIL && emailVerified;
+    const authorizedRecord =
+      (docRole === 'admin' || isAdminClaim) &&
+      (!ADMIN_EMAIL || email === ADMIN_EMAIL || isAdminClaim);
+
+    if (!authorizedOwnerEmail && !authorizedRecord) {
+      logEvent('warn', 'admin_auth_denied', {
+        uid: decoded.uid,
+        emailPresent: Boolean(email),
       });
+      return res.status(403).json({ ok: false, error: 'Admin privileges required' });
     }
 
-    const transactionId = payload?.data?.id;
+    req.adminUser = {
+      uid: decoded.uid,
+      email,
+    };
+    return next();
+  } catch (err) {
+    logEvent('warn', 'admin_token_invalid', { message: err.message });
+    return res.status(401).json({ ok: false, error: 'Invalid or expired auth token' });
+  }
+}
 
-    if (!transactionId) {
+function normalizeUnlockType(rawType, meta = {}) {
+  const val = String(rawType || meta.unlock_type || meta.product_type || '')
+    .trim()
+    .toLowerCase();
+
+  if (['author_unlock', 'author_account', 'author', 'unlock_author'].includes(val)) {
+    return 'author_unlock';
+  }
+  if (['codo_topup', 'codo', 'codo_package', 'wallet_credit'].includes(val)) {
+    return 'codo_topup';
+  }
+  if (['chapter_unlock', 'chapters', 'book_chapters', 'chapter_bundle'].includes(val)) {
+    return 'chapter_unlock';
+  }
+  if (['beta_access', 'beta_reader', 'beta'].includes(val)) {
+    return 'beta_access';
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Routes: Health & Webhook Unlock
+// ---------------------------------------------------------------------------
+app.get('/health', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'doflownovels-backend',
+    firebaseReady,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * POST /api/doflow-unlock
+ * Handles Flutterwave webhook notifications, verifies signature & transaction
+ * server-side, checks idempotency, and applies entitlement in a Firestore tx.
+ */
+app.post('/api/doflow-unlock', webhookLimiter, async (req, res) => {
+  try {
+    if (!firebaseReady || !db) {
+      return res.status(503).json({ ok: false, error: 'Database not initialized' });
+    }
+
+    if (!verifyWebhookSignature(req)) {
+      logEvent('warn', 'webhook_signature_invalid', {
+        ip: req.ip,
+      });
+      return res.status(401).json({ ok: false, error: 'Invalid webhook signature' });
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const eventName = String(body.event || '').trim();
+    const eventData = body.data && typeof body.data === 'object' ? body.data : body;
+
+    if (eventName && eventName !== 'charge.completed') {
+      logEvent('info', 'webhook_ignored_event', { event: eventName });
+      return res.status(200).json({ ok: true, ignored: true, event: eventName });
+    }
+
+    const txId = eventData.id || eventData.transaction_id;
+    const txRef = String(eventData.tx_ref || eventData.reference || '').trim();
+
+    if (!txId || !txRef) {
       return res.status(400).json({
-        error: 'Invalid webhook payload.'
+        ok: false,
+        error: 'Missing transaction id or tx_ref',
       });
     }
 
-    const paymentRef = db.collection('codoTransactions').doc(txRef);
-    const paymentSnapshot = await paymentRef.get();
+    // Always verify authoritative payment state directly with Flutterwave API
+    const verifiedTx = await fetchVerifiedFlutterwaveTransaction(txId);
 
-    if (!paymentSnapshot.exists) {
-      return res.status(200).json({
-        status: 'ignored'
+    const verifiedStatus = String(verifiedTx.status || '').toLowerCase();
+    const verifiedRef = String(verifiedTx.tx_ref || '').trim();
+    const verifiedCurrency = String(verifiedTx.currency || '').toUpperCase();
+    const verifiedAmount = Number(verifiedTx.amount);
+
+    if (verifiedStatus !== 'successful' || verifiedRef !== txRef) {
+      logEvent('warn', 'webhook_tx_verification_failed', {
+        txId: String(txId),
+        txRef,
+        verifiedStatus,
+      });
+      return res.status(400).json({
+        ok: false,
+        error: 'Transaction not successful or reference mismatch',
       });
     }
 
-    const payment = paymentSnapshot.data();
+    if (!Number.isFinite(verifiedAmount) || verifiedAmount <= 0) {
+      return res.status(400).json({ ok: false, error: 'Invalid verified amount' });
+    }
 
-    if (payment.status === 'successful') {
-      return res.status(200).json({
-        status: 'already_processed'
+    const meta =
+      verifiedTx.meta && typeof verifiedTx.meta === 'object'
+        ? verifiedTx.meta
+        : eventData.meta && typeof eventData.meta === 'object'
+          ? eventData.meta
+          : {};
+
+    const purchaserUid = String(meta.uid || meta.userId || '').trim();
+    const purchaserEmail = String(
+      (verifiedTx.customer && verifiedTx.customer.email) || meta.email || ''
+    )
+      .trim()
+      .toLowerCase();
+
+    const unlockType = normalizeUnlockType(meta.unlock_type || meta.product_type, meta);
+    if (!unlockType) {
+      logEvent('warn', 'webhook_unknown_unlock_type', { txRef, meta });
+      return res.status(400).json({ ok: false, error: 'Unrecognized unlock product type' });
+    }
+
+    // Server-side package/product validation (never trust client-claimed credit counts)
+    let codoCredit = 0;
+    const bookId = String(meta.bookId || meta.book_id || '').trim() || null;
+    const assignmentId =
+      String(meta.assignmentId || meta.assignment_id || '').trim() || null;
+    const chapterIds = Array.isArray(meta.chapterIds)
+      ? meta.chapterIds.map((c) => String(c).trim()).filter(Boolean).slice(0, 5)
+      : [];
+
+    if (unlockType === 'codo_topup') {
+      // Confirmed regional baseline packages: NGN 300 -> 85 CODO, USD 2 -> 85 CODO
+      if (verifiedCurrency === 'NGN' && Math.abs(verifiedAmount - 300) < 0.01) {
+        codoCredit = 85;
+      } else if (verifiedCurrency === 'USD' && Math.abs(verifiedAmount - 2) < 0.01) {
+        codoCredit = 85;
+      } else {
+        logEvent('warn', 'codo_package_unmatched', {
+          txRef,
+          verifiedCurrency,
+          verifiedAmount,
+        });
+        return res.status(400).json({
+          ok: false,
+          error: 'Amount and currency do not match an approved CODO package',
+        });
+      }
+    }
+
+    if (unlockType === 'chapter_unlock' && (!bookId || chapterIds.length === 0)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Chapter unlock requires bookId and up to 5 chapterIds',
       });
     }
 
-    const flutterwaveResponse = await fetch(
-      `https://api.flutterwave.com/v3/transactions/${transactionId}/verify`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`
+    if (unlockType === 'beta_access' && !assignmentId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Beta access unlock requires assignmentId',
+      });
+    }
+
+    const paymentDocId = `flw_${String(txId)}`;
+    const paymentRef = db.collection('payments').doc(paymentDocId);
+
+    const txResult = await db.runTransaction(async (t) => {
+      const existingPayment = await t.get(paymentRef);
+      if (existingPayment.exists) {
+        return { duplicate: true, docId: paymentDocId };
+      }
+
+      // Resolve target user document (by UID or verified customer email)
+      let userRef = null;
+      if (purchaserUid) {
+        userRef = db.collection('users').doc(purchaserUid);
+      } else if (purchaserEmail) {
+        const snap = await t.get(
+          db.collection('users').where('emailLower', '==', purchaserEmail).limit(1)
+        );
+        if (!snap.empty) {
+          userRef = snap.docs[0].ref;
         }
       }
-    );
 
-    const flutterwaveData = await flutterwaveResponse.json();
+      if (!userRef) {
+        throw new Error('PURCHASER_NOT_FOUND');
+      }
 
-    const isValid =
-      flutterwaveData?.status === 'success' &&
-      flutterwaveData?.data?.status === 'successful' &&
-      flutterwaveData?.data?.tx_ref === txRef &&
-      Number(flutterwaveData?.data?.amount) === Number(payment.amount) &&
-      String(flutterwaveData?.data?.currency).toUpperCase() === payment.currency;
+      const userSnap = await t.get(userRef);
+      if (!userSnap.exists) {
+        throw new Error('PURCHASER_NOT_FOUND');
+      }
 
-    if (!isValid) {
-      await paymentRef.update({
-        status: 'webhook_verification_failed',
-        updatedAt: serverTimestamp()
+      const userData = userSnap.data() || {};
+      const resolvedUid = userRef.id;
+      const currentCodo = Number(userData.codoBalance || 0);
+
+      const userUpdates = {
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      if (unlockType === 'author_unlock') {
+        userUpdates.authorUnlocked = true;
+        userUpdates.authorUnlockedAt = admin.firestore.FieldValue.serverTimestamp();
+        userUpdates.role = userData.role === 'admin' ? 'admin' : 'author';
+      } else if (unlockType === 'codo_topup') {
+        userUpdates.codoBalance = currentCodo + codoCredit;
+      } else if (unlockType === 'chapter_unlock') {
+        const entitlementId = `${resolvedUid}_${bookId}`;
+        const entRef = db.collection('entitlements').doc(entitlementId);
+        t.set(
+          entRef,
+          {
+            uid: resolvedUid,
+            bookId,
+            chapterIds: admin.firestore.FieldValue.arrayUnion(...chapterIds),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      } else if (unlockType === 'beta_access') {
+        const betaEntRef = db
+          .collection('entitlements')
+          .doc(`${resolvedUid}_beta_${assignmentId}`);
+        t.set(
+          betaEntRef,
+          {
+            uid: resolvedUid,
+            assignmentId,
+            betaAccessGranted: true,
+            grantedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+
+      t.set(userRef, userUpdates, { merge: true });
+
+      t.set(paymentRef, {
+        provider: 'flutterwave',
+        transactionId: String(txId),
+        txRef,
+        flwRef: String(verifiedTx.flw_ref || ''),
+        status: 'completed',
+        unlockType,
+        uid: resolvedUid,
+        amount: verifiedAmount,
+        currency: verifiedCurrency,
+        codoCredited: codoCredit,
+        bookId,
+        chapterIds,
+        assignmentId,
+        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      return res.status(400).json({
-        error: 'Payment verification failed.'
+      const ledgerRef = db.collection('wallet_ledger').doc(`led_${paymentDocId}`);
+      t.set(ledgerRef, {
+        uid: resolvedUid,
+        entryType: unlockType,
+        direction: codoCredit > 0 ? 'credit' : 'entitlement',
+        codoDelta: codoCredit,
+        amount: verifiedAmount,
+        currency: verifiedCurrency,
+        txRef,
+        paymentId: paymentDocId,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return {
+        duplicate: false,
+        docId: paymentDocId,
+        uid: resolvedUid,
+        unlockType,
+        codoCredited: codoCredit,
+      };
+    });
+
+    if (txResult.duplicate) {
+      logEvent('info', 'webhook_duplicate_ignored', { txRef, docId: txResult.docId });
+      return res.status(200).json({
+        ok: true,
+        duplicate: true,
+        paymentId: txResult.docId,
       });
     }
 
-    await db.runTransaction(async transaction => {
-      const freshPayment = await transaction.get(paymentRef);
-      const paymentData = freshPayment.data();
-
-      if (paymentData.status === 'successful') {
-        return;
-      }
-
-      const walletRef = db.collection('codoWallets').doc(payment.uid);
-      const walletSnapshot = await transaction.get(walletRef);
-
-      const currentPurchased = walletSnapshot.exists
-        ? Number(walletSnapshot.data().purchasedBills || 0)
-        : 0;
-
-      transaction.set(walletRef, {
-        uid: payment.uid,
-        purchasedBills: currentPurchased + Number(payment.bundle),
-        updatedAt: serverTimestamp()
-      }, { merge: true });
-
-      transaction.update(paymentRef, {
-        status: 'successful',
-        flutterwaveTransactionId: String(transactionId),
-        completedAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
-      });
+    logEvent('info', 'unlock_applied', {
+      paymentId: txResult.docId,
+      uid: txResult.uid,
+      unlockType: txResult.unlockType,
+      codoCredited: txResult.codoCredited,
     });
 
     return res.status(200).json({
-      status: 'success'
+      ok: true,
+      duplicate: false,
+      paymentId: txResult.docId,
+      unlockType: txResult.unlockType,
     });
-  } catch (error) {
-    console.error('Codo webhook error:', error);
-
-    return res.status(500).json({
-      error: 'Internal server error.'
-    });
+  } catch (err) {
+    if (err.message === 'PURCHASER_NOT_FOUND') {
+      return res.status(404).json({ ok: false, error: 'Purchaser account not found' });
+    }
+    logEvent('error', 'doflow_unlock_error', { message: err.message });
+    return res.status(500).json({ ok: false, error: 'Failed to process unlock' });
   }
 });
-// =========================================================
-// 404 AND ERRORS
-// =========================================================
+/**
+ * POST /api/admin/unlock
+ * Requires verified Firebase ID token and server-side owner/admin authorization.
+ * Supports explicit, audited unlock operations on a validated targetUid.
+ */
+app.post('/api/admin/unlock', adminLimiter, requireVerifiedAdmin, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const targetUid = String(body.targetUid || '').trim();
+    const operation = String(body.operation || '').trim();
+    const reason = String(body.reason || '').trim();
 
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Route not found.'
-  });
-});
+    if (!targetUid || !/^[A-Za-z0-9_-]{6,128}$/.test(targetUid)) {
+      return res.status(400).json({ ok: false, error: 'Valid targetUid is required' });
+    }
 
-app.use((error, req, res, next) => {
-  console.error('Unexpected server error:', error);
+    const allowedOperations = new Set([
+      'grant_author_unlock',
+      'revoke_author_unlock',
+      'credit_codo',
+      'grant_beta_access',
+    ]);
 
-  if (res.headersSent) {
-    return next(error);
+    if (!allowedOperations.has(operation)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Unsupported admin unlock operation',
+      });
+    }
+
+    let codoDelta = 0;
+    if (operation === 'credit_codo') {
+      codoDelta = Number(body.codoAmount);
+      if (!Number.isInteger(codoDelta) || codoDelta <= 0 || codoDelta > 100000) {
+        return res.status(400).json({
+          ok: false,
+          error: 'credit_codo requires a positive integer codoAmount (max 100000)',
+        });
+      }
+    }
+
+    const assignmentId = String(body.assignmentId || '').trim();
+    if (operation === 'grant_beta_access' && !assignmentId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'grant_beta_access requires assignmentId',
+      });
+    }
+
+    const targetUserRef = db.collection('users').doc(targetUid);
+    const auditRef = db.collection('audit_logs').doc();
+
+    const result = await db.runTransaction(async (t) => {
+      const targetSnap = await t.get(targetUserRef);
+      if (!targetSnap.exists) {
+        throw new Error('TARGET_USER_NOT_FOUND');
+      }
+
+      const targetData = targetSnap.data() || {};
+      const updates = {
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      if (operation === 'grant_author_unlock') {
+        updates.authorUnlocked = true;
+        updates.authorUnlockedAt = admin.firestore.FieldValue.serverTimestamp();
+        if (targetData.role !== 'admin') {
+          updates.role = 'author';
+        }
+      } else if (operation === 'revoke_author_unlock') {
+        updates.authorUnlocked = false;
+      } else if (operation === 'credit_codo') {
+        const currentBalance = Number(targetData.codoBalance || 0);
+        updates.codoBalance = currentBalance + codoDelta;
+      } else if (operation === 'grant_beta_access') {
+        const betaEntRef = db
+          .collection('entitlements')
+          .doc(`${targetUid}_beta_${assignmentId}`);
+        t.set(
+          betaEntRef,
+          {
+            uid: targetUid,
+            assignmentId,
+            betaAccessGranted: true,
+            grantedByAdminUid: req.adminUser.uid,
+            grantedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+
+      t.set(targetUserRef, updates, { merge: true });
+
+      if (operation === 'credit_codo') {
+        const ledgerRef = db.collection('wallet_ledger').doc();
+        t.set(ledgerRef, {
+          uid: targetUid,
+          entryType: 'admin_codo_credit',
+          direction: 'credit',
+          codoDelta,
+          reason: reason || 'admin_unlock',
+          adminUid: req.adminUser.uid,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      t.set(auditRef, {
+        actorUid: req.adminUser.uid,
+        actorEmail: req.adminUser.email,
+        targetUid,
+        operation,
+        codoDelta: codoDelta || null,
+        assignmentId: assignmentId || null,
+        reason: reason || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return {
+        targetUid,
+        operation,
+        codoDelta,
+        auditId: auditRef.id,
+      };
+    });
+
+    logEvent('info', 'admin_unlock_executed', {
+      auditId: result.auditId,
+      adminUid: req.adminUser.uid,
+      targetUid: result.targetUid,
+      operation: result.operation,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      ...result,
+    });
+  } catch (err) {
+    if (err.message === 'TARGET_USER_NOT_FOUND') {
+      return res.status(404).json({ ok: false, error: 'Target user not found' });
+    }
+    logEvent('error', 'admin_unlock_error', { message: err.message });
+    return res.status(500).json({ ok: false, error: 'Admin unlock operation failed' });
   }
-
-  return res.status(500).json({
-    error: 'Internal server error.'
-  });
 });
 
-const PORT = process.env.PORT || 3000;
+// ---------------------------------------------------------------------------
+// 404 & Global Error Handler
+// ---------------------------------------------------------------------------
+app.use((_req, res) => {
+  res.status(404).json({ ok: false, error: 'Route not found' });
+});
 
+app.use((err, _req, res, _next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ ok: false, error: 'Invalid JSON payload' });
+  }
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ ok: false, error: 'Request payload too large' });
+  }
+  if (err && err.message === 'Origin not allowed by CORS policy') {
+    return res.status(403).json({ ok: false, error: err.message });
+  }
+  logEvent('error', 'unhandled_server_error', {
+    message: err ? err.message : 'Unknown error',
+  });
+  return res.status(500).json({ ok: false, error: 'Internal server error' });
+});
+
+// ---------------------------------------------------------------------------
+// Start Server
+// ---------------------------------------------------------------------------
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Doflownovels backend running on port ${PORT}`);
+  logEvent('info', 'server_started', {
+    port: PORT,
+    firebaseReady,
+    adminEmailConfigured: Boolean(ADMIN_EMAIL),
+  });
 });
